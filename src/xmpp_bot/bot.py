@@ -369,6 +369,26 @@ class XmppBot:
             logger.error(f"Send failed: {e}")
             raise SendError(ERR_SEND_FAILED.format(recipient=jid)) from e
 
+    async def flush(self, timeout: float = 5.0) -> None:
+        """Wait for pending outgoing messages to be written to the network.
+
+        Args:
+            timeout: Maximum time to wait in seconds.
+        """
+        if not self._client or not self._connected:
+            return
+
+        transport = getattr(self._client, "transport", None)
+        if transport is None:
+            return
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            buf_size = getattr(transport, "get_write_buffer_size", lambda: 0)()
+            if buf_size == 0:
+                return
+            await asyncio.sleep(0.05)
+
     async def send_url(self, path: str) -> None:
         """Send a URL constructed from base_url and path.
 
