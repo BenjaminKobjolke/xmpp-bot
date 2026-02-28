@@ -20,6 +20,7 @@ DEFAULT_RETRY_DELAY = 5.0
 DEFAULT_SEND_DELAY = 0.1
 DEFAULT_RESOURCE = "xmpp-bot"
 DEFAULT_DEBUG = False
+MAX_RECONNECT_DELAY = 300
 
 # Error messages
 ERR_JID_REQUIRED = "JID is required"
@@ -49,6 +50,10 @@ LOG_HANDLER_REGISTERED = "Handler '{name}' registered"
 LOG_HANDLER_REMOVED = "Handler '{name}' removed"
 LOG_KEEPALIVE_SENT = "Keepalive presence sent"
 LOG_RECONNECTING = "Reconnecting to XMPP server..."
+LOG_RECONNECT_SUCCESS = "Reconnected to XMPP server successfully"
+LOG_RECONNECT_FAILED = "Reconnection failed: {error}"
+LOG_RECONNECT_TIMEOUT = "Reconnection timed out"
+LOG_RECONNECT_AUTH_FAILED = "Reconnection auth failed, stopping reconnection attempts"
 LOG_SUBSCRIPTION_APPROVED = "Subscription request approved for {jid}"
 
 # Presence types

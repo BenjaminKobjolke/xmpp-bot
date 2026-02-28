@@ -25,8 +25,14 @@ from .config.constants import (
     LOG_MESSAGE_RECEIVED,
     LOG_MESSAGE_SENT,
     LOG_PRESENCE_RECEIVED,
+    LOG_RECONNECT_AUTH_FAILED,
+    LOG_RECONNECT_FAILED,
+    LOG_RECONNECT_SUCCESS,
+    LOG_RECONNECT_TIMEOUT,
+    LOG_RECONNECTING,
     LOG_SENDING_MESSAGE,
     LOG_SUBSCRIPTION_APPROVED,
+    MAX_RECONNECT_DELAY,
 )
 from .config.settings import Settings
 from .exceptions import (
@@ -92,6 +98,8 @@ class XmppBot:
         self._connected: bool = False
         self._session_started: bool = False
         self._auth_error: str | None = None
+        self._disconnect_requested: bool = False
+        self._reconnect_delay: float = 0
 
         self._handlers = HandlerRegistry()
         self._async_message_handlers: dict[str, AsyncMessageHandler] = {}
@@ -169,6 +177,16 @@ class XmppBot:
         self._client.add_event_handler("failed_auth", self._on_failed_auth)
         self._client.add_event_handler("disconnected", self._on_disconnected)
 
+        # Register ping plugin for keepalive
+        self._client.register_plugin("xep_0199")
+        self._client["xep_0199"].enable_keepalive(
+            interval=self._settings.keepalive_interval,
+            timeout=self._settings.connect_timeout,
+        )
+
+        # Configure whitespace keepalive interval
+        self._client.whitespace_keepalive_interval = self._settings.keepalive_interval
+
         # Reset state
         self._session_started = False
         self._auth_error = None
@@ -205,10 +223,72 @@ class XmppBot:
         self._auth_error = "Authentication failed"
 
     def _on_disconnected(self, event: dict[str, Any]) -> None:
-        """Handle disconnection."""
+        """Handle disconnection. Triggers auto-reconnect if not intentional."""
         self._connected = False
         self._session_started = False
         logger.info(LOG_DISCONNECTED)
+
+        if not self._disconnect_requested:
+            asyncio.ensure_future(self._auto_reconnect())
+
+    async def _auto_reconnect(self) -> None:
+        """Attempt to reconnect with exponential backoff."""
+        assert self._settings is not None
+
+        if self._reconnect_delay == 0:
+            self._reconnect_delay = self._settings.retry_delay
+        else:
+            self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
+
+        logger.info(f"{LOG_RECONNECTING} in {self._reconnect_delay}s...")
+        await asyncio.sleep(self._reconnect_delay)
+
+        try:
+            self._session_started = False
+            self._auth_error = None
+
+            self._client = ClientXMPP(
+                self._settings.full_jid,
+                self._settings.password,
+            )
+
+            # Re-register event handlers
+            self._client.add_event_handler("session_start", self._on_session_start)
+            self._client.add_event_handler("message", self._on_message)
+            self._client.add_event_handler("presence_subscribe", self._on_presence_subscribe)
+            self._client.add_event_handler("presence", self._on_presence)
+            self._client.add_event_handler("failed_auth", self._on_failed_auth)
+            self._client.add_event_handler("disconnected", self._on_disconnected)
+
+            # Re-register ping plugin
+            self._client.register_plugin("xep_0199")
+            self._client["xep_0199"].enable_keepalive(
+                interval=self._settings.keepalive_interval,
+                timeout=self._settings.connect_timeout,
+            )
+            self._client.whitespace_keepalive_interval = self._settings.keepalive_interval
+
+            self._client.connect()
+
+            # Wait for session start
+            timeout = self._settings.connect_timeout
+            start_time = asyncio.get_event_loop().time()
+            while not self._session_started and self._auth_error is None:
+                await asyncio.sleep(0.1)
+                if asyncio.get_event_loop().time() - start_time > timeout:
+                    logger.error(LOG_RECONNECT_TIMEOUT)
+                    self._client.disconnect()
+                    return
+
+            if self._auth_error:
+                logger.error(LOG_RECONNECT_AUTH_FAILED)
+                return
+
+            self._connected = True
+            self._reconnect_delay = 0
+            logger.info(LOG_RECONNECT_SUCCESS)
+        except Exception as e:
+            logger.error(LOG_RECONNECT_FAILED.format(error=e))
 
     async def _on_message(self, msg: Message) -> None:
         """Handle incoming messages."""
@@ -421,6 +501,7 @@ class XmppBot:
         if not self._initialized:
             return
 
+        self._disconnect_requested = True
         logger.info(LOG_DISCONNECTING)
 
         if self._client and self._connected:
