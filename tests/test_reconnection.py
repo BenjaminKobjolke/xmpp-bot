@@ -172,6 +172,81 @@ class TestReconnectSuccess:
             assert bot_instance._connected is False
 
 
+class TestReconnectRetryAfterTimeout:
+    """Test that reconnection retries after timeout or exception."""
+
+    async def test_timeout_schedules_another_reconnect(
+        self, bot_instance: XmppBot, valid_settings: Settings
+    ) -> None:
+        """Verify that when reconnection times out, another _auto_reconnect() is scheduled."""
+        bot_instance._reconnect_delay = 0
+        bot_instance._connected = False
+
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock),
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.get_event_loop") as mock_loop,
+            patch("xmpp_bot.bot.asyncio.ensure_future") as mock_ensure_future,
+        ):
+            mock_client_class.return_value = _make_mock_client()
+
+            # First call returns 0 (start_time), second call returns beyond timeout
+            mock_loop.return_value.time.side_effect = [
+                0,
+                valid_settings.connect_timeout + 1,
+            ]
+
+            await bot_instance._auto_reconnect()
+
+            # Should have scheduled another reconnect attempt
+            mock_ensure_future.assert_called_once()
+            assert bot_instance._connected is False
+
+    async def test_exception_schedules_another_reconnect(
+        self, bot_instance: XmppBot, valid_settings: Settings
+    ) -> None:
+        """Verify that when reconnection raises an exception, another _auto_reconnect() is scheduled."""
+        bot_instance._reconnect_delay = 0
+        bot_instance._connected = False
+
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock),
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.ensure_future") as mock_ensure_future,
+        ):
+            mock_client_class.side_effect = RuntimeError("connection refused")
+
+            await bot_instance._auto_reconnect()
+
+            mock_ensure_future.assert_called_once()
+            assert bot_instance._connected is False
+
+    async def test_auth_failure_does_not_retry(
+        self, bot_instance: XmppBot, valid_settings: Settings
+    ) -> None:
+        """Verify that auth failure stops reconnection (no retry scheduled)."""
+        bot_instance._reconnect_delay = 0
+        bot_instance._connected = False
+
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.ensure_future") as mock_ensure_future,
+        ):
+            mock_client_class.return_value = _make_mock_client()
+
+            async def simulate_auth_failure(delay: float) -> None:
+                if delay == 0.1:
+                    bot_instance._auth_error = "Authentication failed"
+
+            mock_sleep.side_effect = simulate_auth_failure
+
+            await bot_instance._auto_reconnect()
+
+            mock_ensure_future.assert_not_called()
+            assert bot_instance._connected is False
+
+
 class TestKeepAliveConfig:
     """Test XEP-0199 ping and whitespace keepalive configuration."""
 

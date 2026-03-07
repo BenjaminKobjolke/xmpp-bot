@@ -278,6 +278,7 @@ class XmppBot:
                 if asyncio.get_event_loop().time() - start_time > timeout:
                     logger.error(LOG_RECONNECT_TIMEOUT)
                     self._client.disconnect()
+                    asyncio.ensure_future(self._auto_reconnect())
                     return
 
             if self._auth_error:
@@ -289,6 +290,7 @@ class XmppBot:
             logger.info(LOG_RECONNECT_SUCCESS)
         except Exception as e:
             logger.error(LOG_RECONNECT_FAILED.format(error=e))
+            asyncio.ensure_future(self._auto_reconnect())
 
     async def _on_message(self, msg: Message) -> None:
         """Handle incoming messages."""
