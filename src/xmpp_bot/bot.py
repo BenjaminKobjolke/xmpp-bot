@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -18,6 +19,7 @@ from .config.constants import (
     ERR_NOT_INITIALIZED,
     ERR_SEND_FAILED,
     LOG_AUTH_SUCCESS,
+    LOG_CONFLICT_DETECTED,
     LOG_CONNECTED,
     LOG_CONNECTING,
     LOG_DISCONNECTED,
@@ -158,6 +160,12 @@ class XmppBot:
         await self._connect()
         self._initialized = True
 
+    def _unique_jid(self) -> str:
+        """Generate a full JID with a unique resource suffix to avoid conflicts."""
+        assert self._settings is not None
+        resource = f"{self._settings.resource}-{uuid.uuid4().hex[:8]}"
+        return f"{self._settings.jid}/{resource}"
+
     async def _connect(self) -> None:
         """Establish connection to the XMPP server."""
         assert self._settings is not None
@@ -165,7 +173,7 @@ class XmppBot:
         logger.info(LOG_CONNECTING.format(jid=self._settings.jid))
 
         self._client = ClientXMPP(
-            self._settings.full_jid,
+            self._unique_jid(),
             self._settings.password,
         )
 
@@ -176,9 +184,12 @@ class XmppBot:
         self._client.add_event_handler("presence", self._on_presence)
         self._client.add_event_handler("failed_auth", self._on_failed_auth)
         self._client.add_event_handler("disconnected", self._on_disconnected)
+        self._client.add_event_handler("stream_error", self._on_stream_error)
 
-        # Register ping plugin for keepalive
-        self._client.register_plugin("xep_0199")
+        # Register plugins
+        self._client.register_plugin("xep_0199")  # Ping / keepalive
+        self._client.register_plugin("xep_0066")  # Out-of-Band Data
+        self._client.register_plugin("xep_0363")  # HTTP File Upload
         self._client["xep_0199"].enable_keepalive(
             interval=self._settings.keepalive_interval,
             timeout=self._settings.connect_timeout,
@@ -222,11 +233,20 @@ class XmppBot:
         """Handle failed authentication."""
         self._auth_error = "Authentication failed"
 
+    def _on_stream_error(self, error: Any) -> None:
+        """Handle XMPP stream errors, detecting resource conflicts."""
+        condition = getattr(error, "condition", str(error))
+        if condition == "conflict" or "conflict" in str(error):
+            logger.warning(LOG_CONFLICT_DETECTED)
+        else:
+            logger.error("Stream error: %s", error)
+
     def _on_disconnected(self, event: dict[str, Any]) -> None:
         """Handle disconnection. Triggers auto-reconnect if not intentional."""
         self._connected = False
         self._session_started = False
         logger.info(LOG_DISCONNECTED)
+        logger.debug("Disconnect event details: %s", event)
 
         if not self._disconnect_requested:
             asyncio.ensure_future(self._auto_reconnect())
@@ -248,7 +268,7 @@ class XmppBot:
             self._auth_error = None
 
             self._client = ClientXMPP(
-                self._settings.full_jid,
+                self._unique_jid(),
                 self._settings.password,
             )
 
@@ -259,9 +279,12 @@ class XmppBot:
             self._client.add_event_handler("presence", self._on_presence)
             self._client.add_event_handler("failed_auth", self._on_failed_auth)
             self._client.add_event_handler("disconnected", self._on_disconnected)
+            self._client.add_event_handler("stream_error", self._on_stream_error)
 
-            # Re-register ping plugin
-            self._client.register_plugin("xep_0199")
+            # Re-register plugins
+            self._client.register_plugin("xep_0199")  # Ping / keepalive
+            self._client.register_plugin("xep_0066")  # Out-of-Band Data
+            self._client.register_plugin("xep_0363")  # HTTP File Upload
             self._client["xep_0199"].enable_keepalive(
                 interval=self._settings.keepalive_interval,
                 timeout=self._settings.connect_timeout,
@@ -294,6 +317,10 @@ class XmppBot:
 
     async def _on_message(self, msg: Message) -> None:
         """Handle incoming messages."""
+        logger.debug(
+            "Raw stanza: type=%s from=%s has_body=%s",
+            msg["type"], msg["from"], bool(msg["body"]),
+        )
         if msg["type"] not in ("chat", "normal"):
             return
 
@@ -340,7 +367,11 @@ class XmppBot:
         presence_type = presence["type"]
         status = presence["status"]
 
-        logger.debug(LOG_PRESENCE_RECEIVED.format(sender=sender, status=status))
+        # Skip noisy self-presence logging
+        if self._settings and presence["from"].bare == self._settings.jid:
+            pass
+        else:
+            logger.debug(LOG_PRESENCE_RECEIVED.format(sender=sender, status=status))
 
         # Call sync handlers (legacy support)
         for sync_handler in self._handlers.get_presence_handlers():
@@ -450,6 +481,48 @@ class XmppBot:
         except Exception as e:
             logger.error(f"Send failed: {e}")
             raise SendError(ERR_SEND_FAILED.format(recipient=jid)) from e
+
+    async def send_audio_file(self, audio_path: str, jid: str) -> None:
+        """Send an audio file to a specific JID via HTTP File Upload (XEP-0363).
+
+        Uploads the file to the XMPP server, then sends the resulting URL
+        as a message with Out-of-Band Data (XEP-0066) so clients can
+        auto-download and play the audio.
+
+        Args:
+            audio_path: Local path to the audio file.
+            jid: The recipient's JID.
+
+        Raises:
+            NotInitializedError: If the bot is not initialized.
+            SendError: If uploading or sending fails.
+        """
+        if not self._initialized:
+            raise NotInitializedError(ERR_NOT_INITIALIZED)
+
+        if not self._connected or not self._client:
+            raise SendError(ERR_SEND_FAILED.format(recipient=jid))
+
+        import mimetypes as _mt
+
+        content_type, _ = _mt.guess_type(audio_path)
+        if not content_type:
+            content_type = "audio/wav"
+
+        try:
+            url = await self._client["xep_0363"].upload_file(
+                audio_path,
+                content_type=content_type,
+            )
+        except Exception as exc:
+            logger.error("HTTP File Upload failed: %s", exc)
+            raise SendError(ERR_SEND_FAILED.format(recipient=jid)) from exc
+
+        mtype: Literal["chat"] = "chat"
+        msg = self._client.make_message(mto=jid, mbody=url, mtype=mtype)
+        msg["oob"]["url"] = url
+        msg.send()
+        logger.debug(LOG_MESSAGE_SENT.format(recipient=jid))
 
     async def flush(self, timeout: float = 5.0) -> None:
         """Wait for pending outgoing messages to be written to the network.

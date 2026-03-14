@@ -55,6 +55,10 @@ LOG_RECONNECT_FAILED = "Reconnection failed: {error}"
 LOG_RECONNECT_TIMEOUT = "Reconnection timed out"
 LOG_RECONNECT_AUTH_FAILED = "Reconnection auth failed, stopping reconnection attempts"
 LOG_SUBSCRIPTION_APPROVED = "Subscription request approved for {jid}"
+LOG_CONFLICT_DETECTED = (
+    "Resource conflict detected — another client is using the same JID. "
+    "Ensure no other instance of this bot is running."
+)
 
 # Presence types
 PRESENCE_AVAILABLE = "available"
