@@ -5,7 +5,7 @@ description = "XMPP bot library using slixmpp"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "slixmpp>=1.8.0",
+    "slixmpp[xep-0363]>=1.8.0",
     "python-dotenv>=1.0.0",
 ]
 
