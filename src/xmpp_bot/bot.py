@@ -101,6 +101,7 @@ class XmppBot:
         self._session_started: bool = False
         self._auth_error: str | None = None
         self._disconnect_requested: bool = False
+        self._reconnecting: bool = False
         self._reconnect_delay: float = 0
 
         self._handlers = HandlerRegistry()
@@ -241,6 +242,17 @@ class XmppBot:
         else:
             logger.error("Stream error: %s", error)
 
+    def _cleanup_client(self, client: ClientXMPP | None = None) -> None:
+        """Disconnect and clean up a ClientXMPP instance without triggering reconnect."""
+        target = client or self._client
+        if target is None:
+            return
+        old_flag = self._disconnect_requested
+        self._disconnect_requested = True
+        with contextlib.suppress(Exception):
+            target.disconnect()
+        self._disconnect_requested = old_flag
+
     def _on_disconnected(self, event: dict[str, Any]) -> None:
         """Handle disconnection. Triggers auto-reconnect if not intentional."""
         self._connected = False
@@ -248,72 +260,98 @@ class XmppBot:
         logger.info(LOG_DISCONNECTED)
         logger.debug("Disconnect event details: %s", event)
 
-        if not self._disconnect_requested:
+        if not self._disconnect_requested and not self._reconnecting:
             asyncio.ensure_future(self._auto_reconnect())
 
     async def _auto_reconnect(self) -> None:
         """Attempt to reconnect with exponential backoff."""
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        try:
+            await self._reconnect_loop()
+        finally:
+            self._reconnecting = False
+
+    async def _reconnect_loop(self) -> None:
+        """Internal reconnect loop. Retries until success, auth failure, or shutdown."""
         assert self._settings is not None
 
-        if self._reconnect_delay == 0:
-            self._reconnect_delay = self._settings.retry_delay
-        else:
-            self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
-
-        logger.info(f"{LOG_RECONNECTING} in {self._reconnect_delay}s...")
-        await asyncio.sleep(self._reconnect_delay)
-
-        try:
-            self._session_started = False
-            self._auth_error = None
-
-            self._client = ClientXMPP(
-                self._unique_jid(),
-                self._settings.password,
-            )
-
-            # Re-register event handlers
-            self._client.add_event_handler("session_start", self._on_session_start)
-            self._client.add_event_handler("message", self._on_message)
-            self._client.add_event_handler("presence_subscribe", self._on_presence_subscribe)
-            self._client.add_event_handler("presence", self._on_presence)
-            self._client.add_event_handler("failed_auth", self._on_failed_auth)
-            self._client.add_event_handler("disconnected", self._on_disconnected)
-            self._client.add_event_handler("stream_error", self._on_stream_error)
-
-            # Re-register plugins
-            self._client.register_plugin("xep_0199")  # Ping / keepalive
-            self._client.register_plugin("xep_0066")  # Out-of-Band Data
-            self._client.register_plugin("xep_0363")  # HTTP File Upload
-            self._client["xep_0199"].enable_keepalive(
-                interval=self._settings.keepalive_interval,
-                timeout=self._settings.connect_timeout,
-            )
-            self._client.whitespace_keepalive_interval = self._settings.keepalive_interval
-
-            self._client.connect()
-
-            # Wait for session start
-            timeout = self._settings.connect_timeout
-            start_time = asyncio.get_event_loop().time()
-            while not self._session_started and self._auth_error is None:
-                await asyncio.sleep(0.1)
-                if asyncio.get_event_loop().time() - start_time > timeout:
-                    logger.error(LOG_RECONNECT_TIMEOUT)
-                    self._client.disconnect()
-                    asyncio.ensure_future(self._auto_reconnect())
-                    return
-
-            if self._auth_error:
-                logger.error(LOG_RECONNECT_AUTH_FAILED)
+        while True:
+            if self._disconnect_requested:
                 return
 
-            self._connected = True
-            self._reconnect_delay = 0
-            logger.info(LOG_RECONNECT_SUCCESS)
-        except Exception as e:
-            logger.error(LOG_RECONNECT_FAILED.format(error=e))
-            asyncio.ensure_future(self._auto_reconnect())
+            if self._reconnect_delay == 0:
+                self._reconnect_delay = self._settings.retry_delay
+            else:
+                self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
+
+            logger.info(f"{LOG_RECONNECTING} in {self._reconnect_delay}s...")
+            await asyncio.sleep(self._reconnect_delay)
+
+            if self._disconnect_requested:
+                return
+
+            try:
+                self._cleanup_client()
+                self._session_started = False
+                self._auth_error = None
+
+                self._client = ClientXMPP(
+                    self._unique_jid(),
+                    self._settings.password,
+                )
+
+                # Re-register event handlers
+                self._client.add_event_handler("session_start", self._on_session_start)
+                self._client.add_event_handler("message", self._on_message)
+                self._client.add_event_handler(
+                    "presence_subscribe", self._on_presence_subscribe
+                )
+                self._client.add_event_handler("presence", self._on_presence)
+                self._client.add_event_handler("failed_auth", self._on_failed_auth)
+                self._client.add_event_handler("disconnected", self._on_disconnected)
+                self._client.add_event_handler("stream_error", self._on_stream_error)
+
+                # Re-register plugins
+                self._client.register_plugin("xep_0199")  # Ping / keepalive
+                self._client.register_plugin("xep_0066")  # Out-of-Band Data
+                self._client.register_plugin("xep_0363")  # HTTP File Upload
+                self._client["xep_0199"].enable_keepalive(
+                    interval=self._settings.keepalive_interval,
+                    timeout=self._settings.connect_timeout,
+                )
+                self._client.whitespace_keepalive_interval = (
+                    self._settings.keepalive_interval
+                )
+
+                self._client.connect()
+
+                # Wait for session start
+                timeout = self._settings.connect_timeout
+                start_time = asyncio.get_event_loop().time()
+                timed_out = False
+                while not self._session_started and self._auth_error is None:
+                    await asyncio.sleep(0.1)
+                    if asyncio.get_event_loop().time() - start_time > timeout:
+                        logger.error(LOG_RECONNECT_TIMEOUT)
+                        timed_out = True
+                        break
+
+                if timed_out:
+                    continue  # retry outer loop
+
+                if self._auth_error:
+                    logger.error(LOG_RECONNECT_AUTH_FAILED)
+                    return
+
+                self._connected = True
+                self._reconnect_delay = 0
+                logger.info(LOG_RECONNECT_SUCCESS)
+                return
+            except Exception as e:
+                logger.error(LOG_RECONNECT_FAILED.format(error=e))
+                continue  # retry via loop
 
     async def _on_message(self, msg: Message) -> None:
         """Handle incoming messages."""
@@ -586,6 +624,7 @@ class XmppBot:
         self._connected = False
         self._initialized = False
         self._session_started = False
+        self._reconnecting = False
         self._client = None
         self._handlers.clear()
         self._async_message_handlers.clear()
