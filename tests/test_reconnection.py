@@ -21,6 +21,9 @@ class TestAutoReconnect:
             bot_instance, "_auto_reconnect", new_callable=AsyncMock
         ) as mock_reconnect:
             bot_instance._on_disconnected({})
+            # Flag must be set synchronously before the coroutine runs
+            assert bot_instance._reconnecting is True
+            assert bot_instance._reconnect_task is not None
             # Yield control so ensure_future-scheduled task runs
             await asyncio.sleep(0)
 
@@ -61,6 +64,7 @@ def _make_mock_client() -> MagicMock:
     mock_client = MagicMock()
     mock_client.connect.return_value = None
     mock_client.add_event_handler = MagicMock()
+    mock_client.del_event_handler = MagicMock()
     mock_client.register_plugin = MagicMock()
     mock_client.__getitem__ = MagicMock(return_value=MagicMock())
     return mock_client
@@ -74,6 +78,7 @@ class TestExponentialBackoff:
     ) -> None:
         """Test first reconnect attempt uses retry_delay from settings."""
         assert bot_instance._reconnect_delay == 0
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -97,6 +102,7 @@ class TestExponentialBackoff:
     ) -> None:
         """Test that delay doubles on each subsequent attempt."""
         bot_instance._reconnect_delay = valid_settings.retry_delay  # 5.0
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -118,6 +124,7 @@ class TestExponentialBackoff:
     async def test_backoff_caps_at_max(self, bot_instance: XmppBot) -> None:
         """Test that backoff delay is capped at MAX_RECONNECT_DELAY."""
         bot_instance._reconnect_delay = MAX_RECONNECT_DELAY
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -145,6 +152,7 @@ class TestReconnectSuccess:
     ) -> None:
         """Test that backoff delay resets to 0 on successful reconnect."""
         bot_instance._reconnect_delay = 40.0
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -167,6 +175,7 @@ class TestReconnectSuccess:
         """Test that auth failure during reconnect stops reconnection."""
         bot_instance._reconnect_delay = 0
         bot_instance._connected = False
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -194,6 +203,7 @@ class TestReconnectRetryAfterTimeout:
         """Verify that when reconnection times out, the loop retries."""
         bot_instance._reconnect_delay = 0
         bot_instance._connected = False
+        bot_instance._reconnecting = True
 
         call_count = 0
 
@@ -232,6 +242,7 @@ class TestReconnectRetryAfterTimeout:
         """Verify that when reconnection raises an exception, the loop retries."""
         bot_instance._reconnect_delay = 0
         bot_instance._connected = False
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -264,6 +275,7 @@ class TestReconnectRetryAfterTimeout:
         """Verify that auth failure stops reconnection (no retry)."""
         bot_instance._reconnect_delay = 0
         bot_instance._connected = False
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -307,6 +319,7 @@ class TestReconnectGuard:
         """Test that _reconnecting is cleared after successful reconnect."""
         bot_instance._reconnect_delay = 0
         bot_instance._connected = False
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -332,6 +345,7 @@ class TestReconnectGuard:
     ) -> None:
         """Test that _reconnecting is cleared after auth failure."""
         bot_instance._reconnect_delay = 0
+        bot_instance._reconnecting = True
 
         with (
             patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
@@ -348,6 +362,90 @@ class TestReconnectGuard:
             await bot_instance._auto_reconnect()
 
             assert bot_instance._reconnecting is False
+
+
+class TestReconnectTaskTracking:
+    """Test asyncio.Task-based reconnect tracking."""
+
+    async def test_multiple_disconnect_events_single_reconnect(
+        self, bot_instance: XmppBot, mock_slixmpp_modules: dict[str, Any]
+    ) -> None:
+        """Test that 40 rapid disconnect events only spawn one reconnect."""
+        with patch.object(
+            bot_instance, "_auto_reconnect", new_callable=AsyncMock
+        ) as mock_reconnect:
+            # Simulate 40 disconnect events fired synchronously
+            for _ in range(40):
+                bot_instance._on_disconnected({})
+
+            await asyncio.sleep(0)
+
+            # Only one reconnect should have been scheduled
+            mock_reconnect.assert_awaited_once()
+            assert bot_instance._reconnecting is True
+
+    async def test_cancelled_error_during_reconnect(
+        self, bot_instance: XmppBot, valid_settings: Settings
+    ) -> None:
+        """Test that CancelledError during sleep clears reconnecting flag."""
+        bot_instance._reconnect_delay = 0
+        bot_instance._reconnecting = True
+
+        with patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = asyncio.CancelledError()
+
+            await bot_instance._auto_reconnect()
+
+            assert bot_instance._reconnecting is False
+            assert bot_instance._reconnect_task is None
+
+    async def test_disconnect_cancels_reconnect_task(
+        self, mock_slixmpp_modules: dict[str, Any], valid_settings: Settings
+    ) -> None:
+        """Test that disconnect() cancels any running reconnect task."""
+        bot = XmppBot.get_instance()
+        bot._settings = valid_settings
+        bot._client = mock_slixmpp_modules["client"]
+        bot._initialized = True
+        bot._connected = True
+
+        mock_task = MagicMock(spec=asyncio.Task)
+        bot._reconnect_task = mock_task
+        bot._reconnecting = True
+
+        bot.disconnect()
+
+        mock_task.cancel.assert_called_once()
+        assert bot._reconnect_task is None
+        assert bot._reconnecting is False
+
+    async def test_cleanup_client_removes_event_handlers(
+        self, bot_instance: XmppBot, mock_slixmpp_modules: dict[str, Any]
+    ) -> None:
+        """Test that _cleanup_client removes event handlers before disconnecting."""
+        mock_client = mock_slixmpp_modules["client"]
+        mock_client.del_event_handler = MagicMock()
+
+        bot_instance._cleanup_client()
+
+        # Verify del_event_handler was called for critical events
+        calls = mock_client.del_event_handler.call_args_list
+        event_names = [call[0][0] for call in calls]
+        assert "disconnected" in event_names
+        assert "session_start" in event_names
+        assert "message" in event_names
+
+    async def test_reconnecting_flag_set_synchronously(
+        self, bot_instance: XmppBot, mock_slixmpp_modules: dict[str, Any]
+    ) -> None:
+        """Test that _reconnecting is True immediately after _on_disconnected, before yielding."""
+        with patch.object(
+            bot_instance, "_auto_reconnect", new_callable=AsyncMock
+        ):
+            bot_instance._on_disconnected({})
+            # Check BEFORE yielding - flag must already be True
+            assert bot_instance._reconnecting is True
+            assert bot_instance._reconnect_task is not None
 
 
 class TestKeepAliveConfig:

@@ -51,6 +51,7 @@ def mock_slixmpp_client() -> Generator[MagicMock, None, None]:
         mock_client.get_roster = AsyncMock(return_value=None)
         mock_client.process.return_value = None
         mock_client.add_event_handler = MagicMock()
+        mock_client.del_event_handler = MagicMock()
         mock_client_class.return_value = mock_client
         yield mock_client
 
@@ -76,6 +77,7 @@ def mock_slixmpp_modules() -> Generator[dict[str, Any], None, None]:
             event_handlers[event].append(handler)
 
         mock_client.add_event_handler = MagicMock(side_effect=add_event_handler)
+        mock_client.del_event_handler = MagicMock()
         mock_client_class.return_value = mock_client
 
         yield {

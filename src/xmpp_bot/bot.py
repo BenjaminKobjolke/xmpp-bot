@@ -85,6 +85,8 @@ class XmppBot:
         """Reset the singleton instance. Used for testing."""
         if cls._instance is not None:
             with contextlib.suppress(Exception):
+                if cls._instance._reconnect_task is not None:
+                    cls._instance._reconnect_task.cancel()
                 cls._instance.disconnect()
             cls._instance = None
 
@@ -102,6 +104,7 @@ class XmppBot:
         self._auth_error: str | None = None
         self._disconnect_requested: bool = False
         self._reconnecting: bool = False
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._reconnect_delay: float = 0
 
         self._handlers = HandlerRegistry()
@@ -247,6 +250,19 @@ class XmppBot:
         target = client or self._client
         if target is None:
             return
+        # Remove our event handlers BEFORE disconnecting to prevent stale
+        # "disconnected" events from spawning duplicate reconnect coroutines.
+        for event_name, handler in [
+            ("session_start", self._on_session_start),
+            ("message", self._on_message),
+            ("presence_subscribe", self._on_presence_subscribe),
+            ("presence", self._on_presence),
+            ("failed_auth", self._on_failed_auth),
+            ("disconnected", self._on_disconnected),
+            ("stream_error", self._on_stream_error),
+        ]:
+            with contextlib.suppress(Exception):
+                target.del_event_handler(event_name, handler)
         old_flag = self._disconnect_requested
         self._disconnect_requested = True
         with contextlib.suppress(Exception):
@@ -260,18 +276,26 @@ class XmppBot:
         logger.info(LOG_DISCONNECTED)
         logger.debug("Disconnect event details: %s", event)
 
-        if not self._disconnect_requested and not self._reconnecting:
-            asyncio.ensure_future(self._auto_reconnect())
+        if self._disconnect_requested or self._reconnecting:
+            return
+        # Set the flag SYNCHRONOUSLY so that any further "disconnected" events
+        # in the same event-loop tick see it as True before the coroutine runs.
+        self._reconnecting = True
+        self._reconnect_task = asyncio.ensure_future(self._auto_reconnect())
 
     async def _auto_reconnect(self) -> None:
-        """Attempt to reconnect with exponential backoff."""
-        if self._reconnecting:
-            return
-        self._reconnecting = True
+        """Attempt to reconnect with exponential backoff.
+
+        The _reconnecting flag is set synchronously in _on_disconnected
+        before this coroutine starts, so there is no check-then-act race.
+        """
         try:
             await self._reconnect_loop()
+        except asyncio.CancelledError:
+            logger.debug("Reconnect task cancelled")
         finally:
             self._reconnecting = False
+            self._reconnect_task = None
 
     async def _reconnect_loop(self) -> None:
         """Internal reconnect loop. Retries until success, auth failure, or shutdown."""
@@ -616,6 +640,11 @@ class XmppBot:
 
         self._disconnect_requested = True
         logger.info(LOG_DISCONNECTING)
+
+        # Cancel any in-flight reconnect task
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
 
         if self._client and self._connected:
             with contextlib.suppress(Exception):
