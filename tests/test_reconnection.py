@@ -215,10 +215,14 @@ class TestReconnectRetryAfterTimeout:
             mock_client_class.return_value = _make_mock_client()
 
             # First iteration: times out. Second iteration: succeeds.
-            time_values = iter([
-                0, valid_settings.connect_timeout + 1,  # 1st attempt: timeout
-                0, 1,  # 2nd attempt: start_time, then check (within timeout)
-            ])
+            time_values = iter(
+                [
+                    0,
+                    valid_settings.connect_timeout + 1,  # 1st attempt: timeout
+                    0,
+                    1,  # 2nd attempt: start_time, then check (within timeout)
+                ]
+            )
             mock_loop.return_value.time.side_effect = lambda: next(time_values)
 
             async def simulate_session_on_second(delay: float) -> None:
@@ -439,13 +443,167 @@ class TestReconnectTaskTracking:
         self, bot_instance: XmppBot, mock_slixmpp_modules: dict[str, Any]
     ) -> None:
         """Test that _reconnecting is True immediately after _on_disconnected, before yielding."""
-        with patch.object(
-            bot_instance, "_auto_reconnect", new_callable=AsyncMock
-        ):
+        with patch.object(bot_instance, "_auto_reconnect", new_callable=AsyncMock):
             bot_instance._on_disconnected({})
             # Check BEFORE yielding - flag must already be True
             assert bot_instance._reconnecting is True
             assert bot_instance._reconnect_task is not None
+
+
+class TestReinitializeAfterDisconnect:
+    """Test that reinitializing after disconnect resets state for auto-reconnect."""
+
+    async def test_initialize_resets_disconnect_requested(
+        self, mock_slixmpp_modules: dict[str, Any], valid_settings: Settings
+    ) -> None:
+        """After disconnect + re-initialize, _disconnect_requested must be False."""
+        bot = XmppBot.get_instance()
+        bot._settings = valid_settings
+        bot._client = mock_slixmpp_modules["client"]
+        bot._initialized = True
+        bot._connected = True
+
+        # disconnect sets _disconnect_requested = True
+        bot.disconnect()
+        assert bot._disconnect_requested is True
+
+        # Re-initialize should reset the flag
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.get_event_loop") as mock_loop,
+        ):
+            mock_client_class.return_value = _make_mock_client()
+            mock_loop.return_value.time.return_value = 0
+
+            async def set_session(delay: float) -> None:
+                if delay == 0.1:
+                    bot._session_started = True
+
+            mock_sleep.side_effect = set_session
+
+            await bot.initialize(settings=valid_settings)
+
+        assert bot._disconnect_requested is False
+
+    async def test_reinitialize_allows_auto_reconnect(
+        self, mock_slixmpp_modules: dict[str, Any], valid_settings: Settings
+    ) -> None:
+        """After disconnect + re-initialize, _on_disconnected must trigger reconnect."""
+        bot = XmppBot.get_instance()
+        bot._settings = valid_settings
+        bot._client = mock_slixmpp_modules["client"]
+        bot._initialized = True
+        bot._connected = True
+
+        # disconnect then re-initialize
+        bot.disconnect()
+
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.get_event_loop") as mock_loop,
+        ):
+            mock_client_class.return_value = _make_mock_client()
+            mock_loop.return_value.time.return_value = 0
+
+            async def set_session(delay: float) -> None:
+                if delay == 0.1:
+                    bot._session_started = True
+
+            mock_sleep.side_effect = set_session
+
+            await bot.initialize(settings=valid_settings)
+
+        # Now simulate an unexpected disconnect
+        with patch.object(bot, "_auto_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            bot._on_disconnected({})
+            await asyncio.sleep(0)
+
+            # Auto-reconnect MUST be triggered (not suppressed)
+            mock_reconnect.assert_awaited_once()
+
+    async def test_initialize_resets_reconnect_delay(
+        self, mock_slixmpp_modules: dict[str, Any], valid_settings: Settings
+    ) -> None:
+        """After disconnect + re-initialize, stale backoff delay must be cleared."""
+        bot = XmppBot.get_instance()
+        bot._settings = valid_settings
+        bot._client = mock_slixmpp_modules["client"]
+        bot._initialized = True
+        bot._connected = True
+        bot._reconnect_delay = 40.0  # stale backoff
+
+        bot.disconnect()
+
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.get_event_loop") as mock_loop,
+        ):
+            mock_client_class.return_value = _make_mock_client()
+            mock_loop.return_value.time.return_value = 0
+
+            async def set_session(delay: float) -> None:
+                if delay == 0.1:
+                    bot._session_started = True
+
+            mock_sleep.side_effect = set_session
+
+            await bot.initialize(settings=valid_settings)
+
+        assert bot._reconnect_delay == 0
+
+
+class TestTimeoutCleanup:
+    """Test that timed-out clients are cleaned up immediately."""
+
+    async def test_timed_out_client_cleaned_up_immediately(
+        self, bot_instance: XmppBot, valid_settings: Settings
+    ) -> None:
+        """When a reconnect attempt times out, _cleanup_client must be called before continue."""
+        bot_instance._reconnect_delay = 0
+        bot_instance._connected = False
+        bot_instance._reconnecting = True
+
+        call_count = 0
+
+        with (
+            patch("xmpp_bot.bot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("xmpp_bot.bot.ClientXMPP") as mock_client_class,
+            patch("xmpp_bot.bot.asyncio.get_event_loop") as mock_loop,
+            patch.object(bot_instance, "_cleanup_client") as mock_cleanup,
+        ):
+            mock_client_class.return_value = _make_mock_client()
+
+            # First iteration: times out. Second iteration: succeeds.
+            time_values = iter(
+                [
+                    0,
+                    valid_settings.connect_timeout + 1,  # 1st attempt: timeout
+                    0,
+                    1,  # 2nd attempt: within timeout
+                ]
+            )
+            mock_loop.return_value.time.side_effect = lambda: next(time_values)
+
+            async def simulate_session_on_second(delay: float) -> None:
+                nonlocal call_count
+                if delay == 0.1:
+                    call_count += 1
+                    if call_count >= 2:
+                        bot_instance._session_started = True
+
+            mock_sleep.side_effect = simulate_session_on_second
+
+            await bot_instance._auto_reconnect()
+
+            # _cleanup_client should be called:
+            # 1) at start of first iteration (existing cleanup)
+            # 2) after timeout in first iteration (new immediate cleanup)
+            # 3) at start of second iteration (existing cleanup)
+            # Total: 3 calls
+            assert mock_cleanup.call_count == 3
 
 
 class TestKeepAliveConfig:

@@ -154,6 +154,11 @@ class XmppBot:
         if self._initialized:
             raise AlreadyInitializedError(ERR_ALREADY_INITIALIZED)
 
+        # Reset flags from any prior disconnect so reconnection works correctly
+        self._disconnect_requested = False
+        self._reconnecting = False
+        self._reconnect_delay = 0
+
         if settings is None:
             settings = Settings.from_env(env_path)
         self._settings = settings
@@ -329,9 +334,7 @@ class XmppBot:
                 # Re-register event handlers
                 self._client.add_event_handler("session_start", self._on_session_start)
                 self._client.add_event_handler("message", self._on_message)
-                self._client.add_event_handler(
-                    "presence_subscribe", self._on_presence_subscribe
-                )
+                self._client.add_event_handler("presence_subscribe", self._on_presence_subscribe)
                 self._client.add_event_handler("presence", self._on_presence)
                 self._client.add_event_handler("failed_auth", self._on_failed_auth)
                 self._client.add_event_handler("disconnected", self._on_disconnected)
@@ -345,9 +348,7 @@ class XmppBot:
                     interval=self._settings.keepalive_interval,
                     timeout=self._settings.connect_timeout,
                 )
-                self._client.whitespace_keepalive_interval = (
-                    self._settings.keepalive_interval
-                )
+                self._client.whitespace_keepalive_interval = self._settings.keepalive_interval
 
                 self._client.connect()
 
@@ -363,6 +364,7 @@ class XmppBot:
                         break
 
                 if timed_out:
+                    self._cleanup_client()
                     continue  # retry outer loop
 
                 if self._auth_error:
@@ -381,7 +383,9 @@ class XmppBot:
         """Handle incoming messages."""
         logger.debug(
             "Raw stanza: type=%s from=%s has_body=%s",
-            msg["type"], msg["from"], bool(msg["body"]),
+            msg["type"],
+            msg["from"],
+            bool(msg["body"]),
         )
         if msg["type"] not in ("chat", "normal"):
             return
