@@ -1,6 +1,6 @@
 # XMPP Bot
 
-A Python XMPP bot library using xmpppy for sending and receiving messages.
+A Python XMPP bot library using slixmpp for sending and receiving messages.
 
 ## Installation
 
@@ -115,7 +115,9 @@ bot.add_presence_handler("status", presence_handler)
 
 - **Singleton pattern** - Single bot instance across your application
 - **Thread-safe** - Background workers for sending and receiving
-- **Auto-reconnection** - Automatically reconnects on connection loss
+- **Auto-reconnection** - Automatically reconnects on connection loss; discarded
+  connections are torn down cleanly, so reconnect churn does not print
+  `RuntimeError: Event loop is closed` finalizer tracebacks
 - **Keepalive** - Periodic presence pings to maintain connection
 - **Access control** - Optional JID allowlist for security
 - **Auto-subscription** - Automatically approves subscription requests
@@ -152,6 +154,8 @@ xmpp-bot/
 │   ├── conftest.py       # Pytest fixtures
 │   ├── test_bot.py
 │   ├── test_handlers.py
+│   ├── test_reconnection.py
+│   ├── test_finalizer.py
 │   └── test_settings.py
 └── tools/
     └── tests.bat
