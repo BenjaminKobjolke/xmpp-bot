@@ -56,6 +56,28 @@ AsyncMessageHandler = Callable[[str, str, Message], Awaitable[None]]
 AsyncPresenceHandler = Callable[[str, str | None, str | None, Presence], Awaitable[None]]
 
 
+def _neutralize_stream_finalizer(client: ClientXMPP | None) -> None:
+    """Make slixmpp's XMLStream.__del__ a no-op for a client we are discarding.
+
+    XMLStream.__del__ calls ``self._run_out_filters.cancel()``, which schedules on the
+    event loop. When the abandoned client is garbage-collected after the loop has
+    stopped/closed, that raises an (ignored but noisy) ``RuntimeError: Event loop is
+    closed``. Cancelling the task and clearing the reference while the loop is still
+    alive leaves ``__del__`` nothing to do (it guards on ``is not None``).
+
+    Touches a slixmpp internal on purpose; the ``getattr`` + ``suppress`` guards make it
+    degrade to a no-op if that attribute ever goes away.
+    """
+    if client is None:
+        return
+    task = getattr(client, "_run_out_filters", None)
+    if task is not None:
+        with contextlib.suppress(Exception):
+            task.cancel()
+        with contextlib.suppress(Exception):
+            client._run_out_filters = None
+
+
 class XmppBot:
     """Singleton XMPP bot for sending and receiving messages using slixmpp."""
 
@@ -222,6 +244,7 @@ class XmppBot:
             await asyncio.sleep(0.1)
             if asyncio.get_event_loop().time() - start_time > timeout:
                 self._client.disconnect()
+                _neutralize_stream_finalizer(self._client)
                 raise ConnectionError(f"Connection timed out after {timeout} seconds")
 
         if self._auth_error:
@@ -272,6 +295,7 @@ class XmppBot:
         self._disconnect_requested = True
         with contextlib.suppress(Exception):
             target.disconnect()
+        _neutralize_stream_finalizer(target)
         self._disconnect_requested = old_flag
 
     def _on_disconnected(self, event: dict[str, Any]) -> None:
@@ -653,6 +677,8 @@ class XmppBot:
         if self._client and self._connected:
             with contextlib.suppress(Exception):
                 self._client.disconnect()
+
+        _neutralize_stream_finalizer(self._client)
 
         self._connected = False
         self._initialized = False
